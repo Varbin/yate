@@ -1236,7 +1236,7 @@ if [[ "x$ac_cv_use_spandsp" = "xstatic" ]]; then
     SPANDSP_LIB="-Wl,-Bstatic $SPANDSP_LIB -ltiff -lz -ljpeg -Wl,-Bdynamic"
 fi
 if [[ "x$ac_cv_use_spandsp" = "xyes" ]]; then
-for i in /usr/include /usr/local/include; do
+for i in /usr/include /usr/local/include /usr/include/spandsp /usr/local/include/spandsp /usr/include; do
     ac_cv_use_spandsp="$i"
     test -f "$ac_cv_use_spandsp/spandsp.h" && break
 done
