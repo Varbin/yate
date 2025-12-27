@@ -22,6 +22,7 @@
 #include <yatephone.h>
 
 #include <string.h>
+#include <cstdlib>
 
 #include <openssl/opensslconf.h>
 #include <openssl/ssl.h>
@@ -68,9 +69,18 @@ static TokenDict s_verifyCodes[] = {
     MAKE_ERR(INVALID_PURPOSE),
     MAKE_ERR(CERT_UNTRUSTED),
     MAKE_ERR(CERT_REJECTED),
+    // Some errors that regularly occur on certificate hostname validation.
+    MAKE_ERR(HOSTNAME_MISMATCH),
+    MAKE_ERR(IP_ADDRESS_MISMATCH),
+    // Errors if the CA has constraints and the certificate violates them (there are more errors possible).
+    MAKE_ERR(PERMITTED_VIOLATION),
+    MAKE_ERR(EXCLUDED_VIOLATION),
     { 0, 0 }
 };
 #undef MAKE_ERR
+
+// Name to use in place of CA certificates to fall back to the old behaviour.
+static const char* INSECURE_SKIP_VERIFY = "insecureskipverify";
 
 static TokenDict s_verifyMode[] = {
     // don't ask for a certificate, don't stop if verification fails
@@ -102,17 +112,21 @@ public:
     void addDomains(String& buf);
     // Release memory, free the context
     virtual void destruct();
+    // Set the CA certificates.
+    bool applyCAs(SslContext * context = nullptr);
     inline operator SSL_CTX*()
 	{ return m_context; }
 protected:
     SSL_CTX* m_context;
     ObjList m_domains;
+    bool m_insecureskipverify;
+    char* m_ca_location;
 };
 
 class SslSocket : public Socket, public Mutex
 {
 public:
-    SslSocket(SOCKET handle, bool server, int verify, SslContext* context = 0);
+    SslSocket(SOCKET handle, bool server, int verify, SslContext* context = 0, const char* hostname = 0);
     virtual ~SslSocket();
     virtual bool terminate();
     virtual bool valid();
@@ -274,6 +288,31 @@ void infoCallback(const SSL* ssl, int where, int retVal)
     }
 }
 
+// Load CA certificates in every possible way
+bool applyCAcertificates(::SSL_CTX* ctx, const char* ca_location) {
+    STACK_OF(X509_NAME)* names = sk_X509_NAME_new_null();
+#if OPENSSL_VERSION_MAJOR >= 3
+    // Certificate stores were introduced with OpenSSL 3.
+    if (::SSL_CTX_load_verify_store(ctx, ca_location) &&
+        ::SSL_add_store_cert_subjects_to_stack(names, ca_location)) {
+        goto ok;
+    }
+#endif
+    if (::SSL_CTX_load_verify_locations(ctx, 0, ca_location) &&
+        ::SSL_add_dir_cert_subjects_to_stack(names, ca_location)) {
+        goto ok;
+    }
+
+    if (::SSL_CTX_load_verify_locations(ctx, ca_location, 0) &&
+        ::SSL_add_file_cert_subjects_to_stack(names, ca_location)) {
+        goto ok;
+    }
+    return false;
+ok:
+    return true;
+}
+
+
 #ifdef DEBUG
 // Callback function called from OpenSSL for protocol messages
 void msgCallback(int write, int version, int content_type, const void* buf,
@@ -295,7 +334,9 @@ void msgCallback(int write, int version, int content_type, const void* buf,
 
 SslContext::SslContext(const char* name)
     : String(name),
-    m_context(0)
+    m_context(0),
+    m_insecureskipverify(false),
+    m_ca_location(0)
 {
     m_context = ::SSL_CTX_new(CTX_METHOD);
     SSL_CTX_set_info_callback(m_context,infoCallback);
@@ -332,6 +373,52 @@ bool SslContext::init(const NamedList& params)
 	DDebug(&__plugin,DebugAll,"Context '%s' loaded domains=%s",
 	    c_str(),d->safe());
     }
+
+    const String& ca_location = params.getParam("ca_location");
+    // I don't know the lifetime of the underlying string, so I better copy it.
+    if (!ca_location.null() && ca_location.length() > 0) {
+        m_ca_location = reinterpret_cast<char *>(malloc(ca_location.length() + 1));
+        strncpy(m_ca_location, ca_location.c_str(), ca_location.length());
+    }
+
+    if (!applyCAs()) {
+        return false;
+    }
+
+    return true;
+}
+
+// Load the CA certificates to the internal OpenSSL context.
+// A parent context can be given to inherit the CA certificates from this location.
+bool SslContext::applyCAs(SslContext *context) {
+    if (context != nullptr) {
+        if (m_ca_location != nullptr) {
+            free(m_ca_location);
+        }
+        m_ca_location = reinterpret_cast<char *>(malloc(strlen(context->m_ca_location) + 1));
+        strncpy(m_ca_location, context->m_ca_location, strlen(context->m_ca_location));
+        m_ca_location[strlen(context->m_ca_location)] = '\0';
+    }
+
+    m_insecureskipverify = false;
+    if (m_ca_location && !strlen(m_ca_location)) {
+        // Use the default CAs location
+        if (::SSL_CTX_set_default_verify_paths(m_context) == 0) {
+            Debug(&__plugin, DebugWarn, "Context '%s' failed to apply default ca certificates.", c_str());
+            return false;
+        }
+    } else if (strcmp(m_ca_location, INSECURE_SKIP_VERIFY) == 0) {
+        // Do not load the CA list, mark it is okay for the domain.
+        m_insecureskipverify = true;
+    } else {
+        // Use a custom CA store, file or directory.
+        // CA stores are only supported with OpenSSL 3.0.0 and later.
+        if (!applyCAcertificates(m_context, m_ca_location)) {
+            Debug(&__plugin, DebugWarn, "Context '%s' failed to load CA certificates from '%s'", c_str(), m_ca_location);
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -409,12 +496,13 @@ void SslContext::addDomains(String& buf)
 void SslContext::destruct()
 {
     ::SSL_CTX_free(m_context);
+    free(m_ca_location);
     String::destruct();
 }
 
 
 // Create a SSL socket from a regular socket handle
-SslSocket::SslSocket(SOCKET handle, bool server, int verify, SslContext* context)
+SslSocket::SslSocket(SOCKET handle, bool server, int verify, SslContext* context, const char* hostname)
     : Socket(handle), Mutex(false,"SslSocket"),
       m_ssl(0)
 {
@@ -431,6 +519,14 @@ SslSocket::SslSocket(SOCKET handle, bool server, int verify, SslContext* context
 	}
 	if (s_index >= 0)
 	    ::SSL_set_ex_data(m_ssl,s_index,this);
+        if (hostname && strlen(hostname)) {
+            if (!::SSL_set1_host(m_ssl, hostname)) {
+                Debug(&__plugin,DebugWarn,"SslSocket::SslSocket(%d) could set hostname (%s), terminating [%p]",
+                      handle, hostname, this);
+                Socket::terminate();
+                return;
+            }
+        }
 	::SSL_set_verify(m_ssl,verify,0);
 	::SSL_set_fd(m_ssl,handle);
 	BIO* bio = ::SSL_get_rbio(m_ssl);
@@ -594,11 +690,19 @@ bool SslHandler::received(Message& msg)
 	    msg.getIntValue("verify",s_verifyMode,SSL_VERIFY_NONE),c);
     }
     else {
-	const String& cert = msg["certificate"];
-	SslContext* c = cert ? new SslContext(msg) : 0;
-	if (!c || c->loadCertificate(cert,msg["key"]))
-	    sSock = new SslSocket(pSock->handle(),false,
-		msg.getIntValue("verify",s_verifyMode,SSL_VERIFY_NONE),c);
+        const String& cert = msg["certificate"];
+        int defaultValue = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+        SslContext* c = new SslContext(msg);
+        //SslContext* c = cert ? new SslContext(msg) : 0;
+        // Hostname given, check if a context exists for a domain
+        if (msg["domain"] != 0 && msg["domain"].length() > 0) {
+            c->applyCAs(__plugin.findContext(msg, true));
+        }
+        if ( !cert || c->loadCertificate(cert,msg["key"])) {
+            sSock = new SslSocket(pSock->handle(),false,
+                msg.getIntValue("verify",s_verifyMode,defaultValue),
+                c, msg["domain"]);
+        }
 	TelEngine::destruct(c);
     }
     if (!(sSock && sSock->valid())) {

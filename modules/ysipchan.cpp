@@ -1333,7 +1333,7 @@ public:
     virtual void msgStatus(Message& msg);
     virtual void statusParams(String& str);
     // Build and dispatch a socket.ssl message
-    bool socketSsl(Socket** sock, bool server, const String& context = String::empty());
+    bool socketSsl(Socket** sock, bool server, const String& context = String::empty(), const String& hostname = String::empty());
     // Send a SIP method
     bool sendMethod(Message& msg, const char* method, bool msgExec = false,
 	const char* target = 0);
@@ -4222,7 +4222,7 @@ int YateSIPTCPTransport::connect(u_int64_t connToutUs)
 	}
 	if (ok) {
 	    // TLS?
-	    if (tls() && !plugin.socketSsl(&sock,false)) {
+	    if (tls() && !plugin.socketSsl(&sock,false, String::empty(), m_remoteAddr)) {
 		m_reason = "SSL not available locally";
 		retVal = -1;
 		ok = false;
@@ -10588,7 +10588,7 @@ void SIPDriver::statusParams(String& str)
 }
 
 // Build and dispatch a socket.ssl message
-bool SIPDriver::socketSsl(Socket** sock, bool server, const String& context)
+bool SIPDriver::socketSsl(Socket** sock, bool server, const String& context, const String& hostname)
 {
     Message m("socket.ssl");
     m.addParam("module",name());
@@ -10598,6 +10598,9 @@ bool SIPDriver::socketSsl(Socket** sock, bool server, const String& context)
 	Lock lock(s_globalMutex);
 	m.addParam("certificate",s_sslCertFile,false);
 	m.addParam("key",s_sslKeyFile,false);
+        // Peer validation only works if a hostname is set
+        // Domain is used for finding contexts by domain.
+        m.addParam("domain", hostname, false);
     }
     if (sock && *sock) {
 	SocketRef* p = new SocketRef(sock);
