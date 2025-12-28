@@ -116,11 +116,15 @@ public:
     bool applyCAs(SslContext * context = nullptr);
     inline operator SSL_CTX*()
 	{ return m_context; }
+    inline bool isClient() {
+        return m_client;
+    }
 protected:
     SSL_CTX* m_context;
     ObjList m_domains;
     bool m_insecureskipverify;
     char* m_ca_location;
+    bool m_client;
 };
 
 class SslSocket : public Socket, public Mutex
@@ -224,10 +228,10 @@ public:
     // Find a context by name or domain
     // This method is not thread safe. The caller must lock the plugin
     // until the returned context is not used anymore
-    SslContext* findContext(const String& token, bool byDomain = false) const;
+    SslContext* findContext(const String& token, bool byDomain = false, bool client = false) const;
     // Find a context from 'context' or 'domain' parameters
     // This method is not thread safe
-    SslContext* findContext(Message& msg) const;
+    SslContext* findContext(Message& msg, bool client = false) const;
 protected:
     virtual void statusParams(String& str);
     virtual void statusDetail(String& str);
@@ -349,9 +353,14 @@ SslContext::SslContext(const char* name)
 // Return false on failure
 bool SslContext::init(const NamedList& params)
 {
-    // Load certificate and key. Check them
-    if (!loadCertificate(params["certificate"],params["key"]))
-	return false;
+    if (params["client"]) {
+        m_client = true;
+    } else {
+        // Load certificate and key. Check them
+        if (!loadCertificate(params["certificate"], params["key"]))
+            return false;
+    }
+
     // Load domains
     m_domains.clear();
     String* d = params.getParam("domains");
@@ -378,7 +387,7 @@ bool SslContext::init(const NamedList& params)
     // I don't know the lifetime of the underlying string, so I better copy it.
     if (!ca_location.null() && ca_location.length() > 0) {
         m_ca_location = reinterpret_cast<char *>(malloc(ca_location.length() + 1));
-        strncpy(m_ca_location, ca_location.c_str(), ca_location.length());
+        strncpy(m_ca_location, ca_location.c_str(), ca_location.length()+1);
     }
 
     if (!applyCAs()) {
@@ -401,13 +410,13 @@ bool SslContext::applyCAs(SslContext *context) {
     }
 
     m_insecureskipverify = false;
-    if (m_ca_location && !strlen(m_ca_location)) {
+    if (!m_ca_location || !strlen(m_ca_location)) {
         // Use the default CAs location
         if (::SSL_CTX_set_default_verify_paths(m_context) == 0) {
             Debug(&__plugin, DebugWarn, "Context '%s' failed to apply default ca certificates.", c_str());
             return false;
         }
-    } else if (strcmp(m_ca_location, INSECURE_SKIP_VERIFY) == 0) {
+    } else if (m_ca_location && strcmp(m_ca_location, INSECURE_SKIP_VERIFY) == 0) {
         // Do not load the CA list, mark it is okay for the domain.
         m_insecureskipverify = true;
     } else {
@@ -691,12 +700,13 @@ bool SslHandler::received(Message& msg)
     }
     else {
         const String& cert = msg["certificate"];
-        int defaultValue = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+        int defaultValue = SSL_VERIFY_PEER;
         SslContext* c = new SslContext(msg);
         //SslContext* c = cert ? new SslContext(msg) : 0;
         // Hostname given, check if a context exists for a domain
         if (msg["domain"] != 0 && msg["domain"].length() > 0) {
-            c->applyCAs(__plugin.findContext(msg, true));
+            SslContext* ctx = __plugin.findContext(msg["domain"], true, true);
+            c->applyCAs(ctx);
         }
         if ( !cert || c->loadCertificate(cert,msg["key"])) {
             sSock = new SslSocket(pSock->handle(),false,
@@ -1075,7 +1085,7 @@ void OpenSSL::initialize()
 }
 
 // Find a context by name or domain
-SslContext* OpenSSL::findContext(const String& token, bool byDomain) const
+SslContext* OpenSSL::findContext(const String& token, bool byDomain, bool client) const
 {
     if (!byDomain) {
 	ObjList* o = m_contexts.find(token);
@@ -1083,24 +1093,24 @@ SslContext* OpenSSL::findContext(const String& token, bool byDomain) const
     }
     for (ObjList* o = m_contexts.skipNull(); o; o = o->skipNext()) {
 	SslContext* c = static_cast<SslContext*>(o->get());
-	if (c->hasDomain(token))
+	if (c->hasDomain(token) && c->isClient() == client)
 	    return c;
     }
     return 0;
 }
 
 // Find a context from 'context' or 'domain' parameters
-SslContext* OpenSSL::findContext(Message& msg) const
+SslContext* OpenSSL::findContext(Message& msg, bool client) const
 {
     SslContext* c = 0;
     const String& context = msg["context"];
     String domain;
     if (context)
-	c = __plugin.findContext(context);
+	c = __plugin.findContext(context, client);
     if (!c) {
 	domain = msg["domain"];
 	if (domain)
-	    c = __plugin.findContext(domain.toLower(),true);
+	    c = __plugin.findContext(domain.toLower(), true, client);
     }
     if (c)
 	return c;
